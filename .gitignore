@@ -1,0 +1,18 @@
+# Virtual environment
+.venv/
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+
+# Jupyter (if you open the lecture's Colab notebook locally)
+.ipynb_checkpoints/
+
+# Saved model weights (later in the lecture these can get large)
+*.pt
+*.pth
+
+# Editor / OS
+.vscode/
+Thumbs.db
+desktop.ini
