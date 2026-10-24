@@ -111,7 +111,7 @@ class MultiHeadAttention(nn.Module):
     
 
 class FeedForward(nn.Module):
-    """ A simple linear layer followed by a non-linearity"""
+    """ A simple linear layer followed by a non-linearity then projection"""
 
     def __init__(self, n_embd):
         super().__init__()
@@ -125,6 +125,35 @@ class FeedForward(nn.Module):
         return self.net(x)
 
 
+class MyLayerNorm:
+    """
+    LayerNorm adapted from the BatchNorm1d in the makemore series.
+    Reference only: the model uses PyTorch's nn.LayerNorm instead.
+    """
+
+    def __init__(self, dim, eps=1e-5):
+        self.eps = eps
+
+        # Parameters (trained with backprop)
+        self.gamma = torch.ones(dim)   # learnable scale (bngain in makemore)
+        self.beta = torch.zeros(dim)   # learnable shift (bnbias in makemore)
+
+    def __call__(self, x):
+        # Calculate the forward pass
+        # BatchNorm averaged over dim 0 (across the batch)
+        # LayerNorm averages over the last dim (across features), giving one mean/variance per token.
+        xmean = x.mean(-1, keepdim=True)                 # per-token mean over features
+        xvar = x.var(-1, keepdim=True, unbiased=False)   # per-token variance over features
+
+        xhat = (x - xmean) / torch.sqrt(xvar + self.eps)  # normalize to zero mean, unit variance
+        self.out = self.gamma * xhat + self.beta
+
+        return self.out
+
+    def parameters(self):
+        return [self.gamma, self.beta]
+
+
 class Block(nn.Module):
     """ Transformer Block: Communication followed by Computation"""
 
@@ -133,6 +162,8 @@ class Block(nn.Module):
         head_size = n_embd // n_head
         self.self_attention = MultiHeadAttention(n_head, head_size) # n heads of (n_embd// n_head)-dimensional self-attention
         self.feed_forward = FeedForward(n_embd)
+        self.layer_norm_1 = nn.LayerNorm(n_embd)
+        self.layer_norm_2 = nn.LayerNorm(n_embd)
 
     def forward(self, x):
         # The residual pathway (also called the residual stream) is the main path that x takes from the embeddings straight to lm_head.
@@ -142,11 +173,15 @@ class Block(nn.Module):
         │
         x ──────────────┐
         │               ▼
+        │           layer_norm_1
+        │               ▼
         │        self_attention
         ▼               │
        (+) ◄────────────┘      Block 1
         │
         x ──────────────┐
+        │               ▼
+        │          layer_norm_2
         │               ▼
         │         feed_forward
         ▼               │
@@ -154,18 +189,19 @@ class Block(nn.Module):
         │
        ... Block 2, Block 3 ...
         │
+     layer_norm_final
+        │
      lm_head
 
         """
-        x = x + self.self_attention(x)
-        x = x + self.feed_forward(x)
+        x = x + self.self_attention(self.layer_norm_1(x))
+        x = x + self.feed_forward(self.layer_norm_2(x))
         return x
 
 
 class BigramLanguageModel(nn.Module):
     def __init__(self):
         super().__init__()
-        # each token directly reads off the logits for the next token from a lookup table
         self.token_embedding_table = nn.Embedding(vocab_size, n_embd) # (B, T, C)
         self.position_embedding_table = nn.Embedding(block_size, n_embd)
         self.blocks = nn.Sequential(
@@ -173,6 +209,7 @@ class BigramLanguageModel(nn.Module):
             Block(n_embd, n_head=4),
             Block(n_embd, n_head=4),
         )
+        self.layer_norm_final = nn.LayerNorm(n_embd)
 
         # Language Modeling Head
         self.lm_head = nn.Linear(n_embd, vocab_size) 
@@ -186,22 +223,23 @@ class BigramLanguageModel(nn.Module):
         pos_embedding = self.position_embedding_table(torch.arange(T, device=device)) # (T, C)
         x = token_embedding + pos_embedding
         x = self.blocks(x) # (B, T, C)
+        x = self.layer_norm_final(x)
         logits = self.lm_head(x) # (B, T, vocab_size)
 
         if targets is None:
             loss = None
         else:
             B, T, C = logits.shape
-            # B: 4, T: 8, C: 65
+            # B: 32, T: 8, C: 65
             # print(f"B: {B}, T: {T}, C: {C}")
 
             logits = logits.view(B * T, C)
-            # torch.Size([32, 65])
+            # torch.Size([256, 65])
             # print(logits.shape)
             # print(f'logits: {logits}')
 
             targets = targets.view(B * T)
-            # torch.Size([32])
+            # torch.Size([256])
             # print(targets.shape)
             # print(f'targets: {targets}')
 
