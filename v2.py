@@ -1,16 +1,21 @@
+import os
+import time
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
 # hyperparameters
-batch_size = 32  # how many independent sequences will we process in parallel?
-block_size = 8  # what is the maximum context length for predictions?
+batch_size = 64  # how many independent sequences will we process in parallel?
+block_size = 256  # what is the maximum context length for predictions?
 max_iters = 5000
 eval_interval = 500
-learning_rate = 1e-3
+learning_rate = 3e-4
 device = "cuda" if torch.cuda.is_available() else "cpu"
 eval_iters = 200
-n_embd = 32
+n_embd = 384
+n_head = 6
+n_layer = 6
+dropout = 0.2
 # ----------------
 
 torch.manual_seed(1337)
@@ -77,6 +82,7 @@ class Head(nn.Module):
         self.query = nn.Linear(n_embd, head_size, bias=False)
         self.value = nn.Linear(n_embd, head_size, bias=False)
         self.register_buffer('tril', torch.tril(torch.ones(block_size, block_size)))
+        self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
         B, T, C = x.shape                 # C = n_embd
@@ -88,6 +94,7 @@ class Head(nn.Module):
         wei = q @ k.transpose(-2, -1) * k.shape[-1]**-0.5   # (B, T, head_size) @ (B, head_size, T) -> (B, T, T)
         wei = wei.masked_fill(self.tril[:T, :T] == 0, float('-inf'))  # (B, T, T)
         wei = F.softmax(wei, dim=-1)      # (B, T, T)
+        wei = self.dropout(wei)
 
         # Weighted aggregation of the values
         v = self.value(x)                 # (B, T, head_size)
@@ -102,10 +109,11 @@ class MultiHeadAttention(nn.Module):
         super().__init__()
         self.heads = nn.ModuleList([Head(head_size) for _ in range(num_heads)])
         self.proj = nn.Linear(n_embd, n_embd)
+        self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
         out = torch.cat([h(x) for h in self.heads], dim=-1)
-        out = self.proj(out) # Linear Transformation of the outcome from concat-ed heads
+        out = self.dropout(self.proj(out)) # Linear Transformation of the outcome from concat-ed heads
 
         return out 
     
@@ -119,6 +127,7 @@ class FeedForward(nn.Module):
             nn.Linear(n_embd, 4 * n_embd), # From paper, inner-layer has dimensionality of 4 times the dimensionality of input and output
             nn.ReLU(),
             nn.Linear(4 * n_embd, n_embd), # Projection layer going back to the residual pathway
+            nn.Dropout(dropout),
         )
 
     def forward(self, x):
@@ -204,11 +213,7 @@ class BigramLanguageModel(nn.Module):
         super().__init__()
         self.token_embedding_table = nn.Embedding(vocab_size, n_embd) # (B, T, C)
         self.position_embedding_table = nn.Embedding(block_size, n_embd)
-        self.blocks = nn.Sequential(
-            Block(n_embd, n_head=4),
-            Block(n_embd, n_head=4),
-            Block(n_embd, n_head=4),
-        )
+        self.blocks = nn.Sequential(*[Block(n_embd, n_head=n_head) for _ in range(n_layer)])
         self.layer_norm_final = nn.LayerNorm(n_embd)
 
         # Language Modeling Head
@@ -273,27 +278,50 @@ class BigramLanguageModel(nn.Module):
 
 model = BigramLanguageModel()
 m = model.to(device)
+print(sum(p.numel() for p in m.parameters()) / 1e6, "M parameters")
 
-# create a PyTorch optimizer
-optimizer = torch.optim.AdamW(m.parameters(), lr=learning_rate)
+if os.path.exists("model.pt"):
+    # Reuse weights from previous run
+    model.load_state_dict(torch.load("model.pt", map_location=device))
+    print("Loaded weights from model.pt!")
 
-for iter in range(max_iters):  # increase number of steps for good results...
-    # every once in awhile evaluate the loss on train and val sets
-    if iter % eval_interval == 0:
-        losses = estimate_loss()
-        print(
-            f"step {iter}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}"
-        )
+else:
 
-    # sample a batch of data
-    xb, yb = get_batch("train")
+    # create a PyTorch optimizer
+    optimizer = torch.optim.AdamW(m.parameters(), lr=learning_rate)
 
-    # evaluate the loss
-    logits, loss = m(xb, yb)
-    optimizer.zero_grad(set_to_none=True)
-    loss.backward()
-    optimizer.step()
+    t0 = time.time()
+    for iter in range(max_iters):
 
+        # every once in awhile evaluate the loss on train and val sets
+        if iter % eval_interval == 0 or iter == max_iters - 1:
+            losses = estimate_loss()
+            print(
+                f"step {iter}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f} "
+                f"({time.time() - t0:.0f}s)"
+            )
 
+        # sample a batch of data
+        xb, yb = get_batch("train")
+
+        # evaluate the loss
+        logits, loss = m(xb, yb)
+        optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        optimizer.step()
+
+    torch.save(model.state_dict(), "model.pt")
+    print("Saved weights to model.pt!")
+
+# Generate samples from model
+model.eval()
 context = torch.zeros((1, 1), dtype=torch.long, device=device)
-print(decode(m.generate(context, max_new_tokens=500)[0].tolist()))
+
+with torch.no_grad():
+    # print(decode(m.generate(context, max_new_tokens=500)[0].tolist()))
+
+    # Write sample to file
+    with open("output.txt", "w", encoding="utf-8") as f:
+        f.write(decode(m.generate(context, max_new_tokens=10000)[0].tolist()))
+
+    print("Saved samples to output.txt!")
