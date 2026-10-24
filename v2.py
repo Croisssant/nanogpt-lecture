@@ -101,9 +101,13 @@ class MultiHeadAttention(nn.Module):
     def __init__(self, num_heads, head_size):
         super().__init__()
         self.heads = nn.ModuleList([Head(head_size) for _ in range(num_heads)])
+        self.proj = nn.Linear(n_embd, n_embd)
 
     def forward(self, x):
-        return torch.cat([h(x) for h in self.heads], dim=-1)
+        out = torch.cat([h(x) for h in self.heads], dim=-1)
+        out = self.proj(out) # Linear Transformation of the outcome from concat-ed heads
+
+        return out 
     
 
 class FeedForward(nn.Module):
@@ -112,12 +116,50 @@ class FeedForward(nn.Module):
     def __init__(self, n_embd):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(n_embd, n_embd),
+            nn.Linear(n_embd, 4 * n_embd), # From paper, inner-layer has dimensionality of 4 times the dimensionality of input and output
             nn.ReLU(),
+            nn.Linear(4 * n_embd, n_embd), # Projection layer going back to the residual pathway
         )
 
     def forward(self, x):
         return self.net(x)
+
+
+class Block(nn.Module):
+    """ Transformer Block: Communication followed by Computation"""
+
+    def __init__(self, n_embd, n_head):
+        super().__init__()
+        head_size = n_embd // n_head
+        self.self_attention = MultiHeadAttention(n_head, head_size) # n heads of (n_embd// n_head)-dimensional self-attention
+        self.feed_forward = FeedForward(n_embd)
+
+    def forward(self, x):
+        # The residual pathway (also called the residual stream) is the main path that x takes from the embeddings straight to lm_head.
+        # Fork off, compute some computation and come back
+        """
+        token_emb + pos_emb
+        │
+        x ──────────────┐
+        │               ▼
+        │        self_attention
+        ▼               │
+       (+) ◄────────────┘      Block 1
+        │
+        x ──────────────┐
+        │               ▼
+        │         feed_forward
+        ▼               │
+       (+) ◄────────────┘
+        │
+       ... Block 2, Block 3 ...
+        │
+     lm_head
+
+        """
+        x = x + self.self_attention(x)
+        x = x + self.feed_forward(x)
+        return x
 
 
 class BigramLanguageModel(nn.Module):
@@ -126,8 +168,11 @@ class BigramLanguageModel(nn.Module):
         # each token directly reads off the logits for the next token from a lookup table
         self.token_embedding_table = nn.Embedding(vocab_size, n_embd) # (B, T, C)
         self.position_embedding_table = nn.Embedding(block_size, n_embd)
-        self.self_attention_heads = MultiHeadAttention(4, n_embd//4) # 4 heads of 8-dimensional self-attention
-        self.feed_forward = FeedForward(n_embd)
+        self.blocks = nn.Sequential(
+            Block(n_embd, n_head=4),
+            Block(n_embd, n_head=4),
+            Block(n_embd, n_head=4),
+        )
 
         # Language Modeling Head
         self.lm_head = nn.Linear(n_embd, vocab_size) 
@@ -140,8 +185,7 @@ class BigramLanguageModel(nn.Module):
         token_embedding = self.token_embedding_table(idx)  # (B, T, n_embd)
         pos_embedding = self.position_embedding_table(torch.arange(T, device=device)) # (T, C)
         x = token_embedding + pos_embedding
-        x = self.self_attention_heads(x) # Apply multiple head of self-attention (B, T, C)
-        x = self.feed_forward(x) # (B, T, C)
+        x = self.blocks(x) # (B, T, C)
         logits = self.lm_head(x) # (B, T, vocab_size)
 
         if targets is None:
